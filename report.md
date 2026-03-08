@@ -22,6 +22,8 @@
 
 ### NanoClaw
 
+NanoClaw decomposes into a small set of named roles: the **Orchestrator (Batman)** that never touches the Claude API directly, the **Filesystem IPC Watcher** that mediates all agent-to-host communication, the **Scheduler Loop** that manages container lifecycle, and the **Channel Adapters** that normalize inbound messages — all running on a Node.js host process. The agent itself executes inside an ephemeral, network-isolated Linux VM and communicates exclusively through atomic JSON files on a shared mount.
+
 ```mermaid
 graph TB
     subgraph HOST["Orchestration Host (Node.js — never touches Claude API)"]
@@ -55,54 +57,53 @@ graph TB
 
 ### OpenClaw
 
+OpenClaw is structured as four named layers. **Layer 1** is the Edge Integration tier — one adapter per channel (WhatsApp/Baileys, Telegram/grammY, Slack/Bolt, Discord, iMessage/BlueBubbles, and others), each 1,000–5,000 lines. **Layer 2** is the Central Control Plane — a Gateway daemon on TCP 18789 with a Router, Session Verification, Interception Hooks, and a Canvas Renderer. **Layer 3** is the Deterministic Execution tier — a Lane Queue (FIFO per session) feeding a ReAct loop with LLM Provider, Tool Executor, and Telemetry streams. **Layer 4** is the State Management tier — file-based Markdown documents under `~/clawd/` (SOUL.md, USER.md, AGENTS.md, MEMORY.md).
+
 ```mermaid
 graph TB
-    subgraph CHANNELS["Channel Adapters (1k–5k lines each)"]
-        WA[WhatsApp / Baileys]
-        TG[Telegram / grammY]
-        SL[Slack / Bolt]
-        DC[Discord]
-        IM[iMessage / BlueBubbles]
-        OT[Signal, Matrix, WeChat, etc.]
+    subgraph L1["Layer 1 — Edge Integration\n(1,000–5,000 lines per adapter)"]
+        WA["WhatsApp / Baileys"]
+        TG["Telegram / grammY"]
+        SL["Slack / Bolt"]
+        DC["Discord"]
+        IM["iMessage / BlueBubbles"]
+        OT["Signal, Matrix, WeChat, etc."]
     end
-
-    subgraph GW["Gateway Control Plane (TCP 18789 WS)"]
-        ROUTER[Router / Lane Queue]
-        AUTH[Auth / Token Validation]
-        HOOKS[Interception Hooks]
-        CANVAS[Canvas Renderer]
-        MEMORY[File-based Memory]
+    subgraph L2["Layer 2 — Central Control Plane\n(Gateway Daemon, TCP 18789 WS)"]
+        ROUTER["Router"]
+        AUTH["Session Verification\n& Cryptographic Validation"]
+        HOOKS["Interception Hooks\n(bootstrap / before_model_resolve /\nbefore_prompt_build /\nbefore_tool_call / agent_end)"]
+        CANVAS["Canvas Renderer\n(/__openclaw__/canvas/)"]
+        AUTH --> ROUTER
         ROUTER --> HOOKS
-        ROUTER --> MEMORY
         ROUTER --> CANVAS
     end
-
-    subgraph AGENT["Agent Runner (ReAct loop)"]
-        LLM[LLM Provider]
-        TOOLS2[Tool Executor]
-        TELEM[Telemetry Streams]
-        LLM -->|tool_use| TOOLS2
-        TOOLS2 -->|result| LLM
+    subgraph L3["Layer 3 — Deterministic Execution\n(Lane Queue — ReAct loop)"]
+        LANE["Lane Queue\nFIFO per session\ncontrolled parallelism for idempotent tasks"]
+        LLM["LLM Provider"]
+        TOOLS["Tool Executor"]
+        TELEM["Telemetry\n(Tool / Assistant / Lifecycle streams)"]
+        LANE --> LLM
+        LLM -->|tool_use JSON| TOOLS
+        TOOLS -->|result| LLM
         LLM --> TELEM
     end
-
-    subgraph NODES["Hardware Nodes"]
-        MOB[Mobile Apps iOS/Android]
-        MAC[macOS Native App]
-        HW[camera.snap / location.get / screen.record]
+    subgraph L4["Layer 4 — State Management\n(~/clawd/ file-based Markdown)"]
+        SOUL["SOUL.md"]
+        USER["USER.md"]
+        AGENTS["AGENTS.md"]
+        MEMORY["MEMORY.md"]
     end
-
-    CHANNELS -->|normalized events| ROUTER
-    AUTH --> ROUTER
-    ROUTER -->|lane-queued task| AGENT
-    AGENT -->|response| ROUTER
-    ROUTER -->|outbound| CHANNELS
-    NODES <-->|WebSocket| GW
-
-    style GW fill:#0f3460,color:#eee,stroke:#533483
-    style AGENT fill:#16213e,color:#eee,stroke:#e94560
-    style CHANNELS fill:#1a1a2e,color:#eee,stroke:#4a4a8a
-    style NODES fill:#1b1b2f,color:#eee,stroke:#ffd460
+    L1 -->|normalized payload| L2
+    ROUTER -->|lane-queued task| L3
+    L3 -->|response| ROUTER
+    ROUTER -->|outbound| L1
+    L3 <-->|read/write| L4
+    L2 <-->|read| L4
+    style L1 fill:#1a1a2e,color:#eee,stroke:#4a4a8a
+    style L2 fill:#0f3460,color:#eee,stroke:#533483
+    style L3 fill:#16213e,color:#eee,stroke:#e94560
+    style L4 fill:#2a1a3a,color:#ddaaff,stroke:#7a4a9a
 ```
 
 ---
@@ -111,23 +112,47 @@ graph TB
 
 ### NanoClaw — Defense in Depth (OS-level)
 
+NanoClaw enforces **six** distinct security boundaries. B1 now runs the container agent under non-root UID 1000 in addition to the `--rm` flag. B2's cryptographic mount guard blocks an expanded blocklist that includes `.gnupg`, `.env`, and `id_rsa` in addition to `.ssh`, `.aws`, and `.kube`. B6 is a new boundary: the project root is mounted read-only, preventing the agent from modifying its own tooling or orchestration code.
+
 ```mermaid
 graph LR
-    subgraph BOUNDARIES["5 Security Boundaries"]
-        B1["① Ephemeral Container\n--rm flag, zero persistence"]
-        B2["② Cryptographic Mount Guard\nno .ssh / .aws / .kube\nsymlink resolution before mount"]
+    subgraph BOUNDARIES["6 Security Boundaries"]
+        B1["① Ephemeral Container\n--rm flag, zero persistence\nnon-root UID 1000"]
+        B2["② Cryptographic Mount Guard\nno .ssh / .aws / .kube /\n.gnupg / .env / id_rsa\nsymlink resolution before mount"]
         B3["③ Session Partitioning\nper-group Claude config dirs\nfilesystem-level isolation"]
         B4["④ IPC Authorization\ncryptographic verification\nof all filesystem JSON requests"]
         B5["⑤ Credential Isolation\nonly ANTHROPIC_API_KEY passed\nno persistent auth in container"]
+        B6["⑥ Read-Only Project Root\nproject root mounted read-only\nagent cannot modify own tooling"]
     end
 
-    B1 --> B2 --> B3 --> B4 --> B5
+    B1 --> B2 --> B3 --> B4 --> B5 --> B6
 
     style B1 fill:#2d2d2d,color:#7fdbff
     style B2 fill:#2d2d2d,color:#7fdbff
     style B3 fill:#2d2d2d,color:#7fdbff
     style B4 fill:#2d2d2d,color:#7fdbff
     style B5 fill:#2d2d2d,color:#7fdbff
+    style B6 fill:#2d2d2d,color:#7fdbff
+```
+
+### NanoClaw — Trust Taxonomy
+
+NanoClaw applies a four-tier trust hierarchy that is enforced structurally — not by policy flags — because each tier is implemented at a different system boundary.
+
+```mermaid
+graph TD
+    ROOT["Trusted Root\n(Main Group)\nCross-group commands\nGlobal memory writes\nSystem reconfiguration"]
+    UNTRUSTED["Untrusted\n(Non-Main Groups)\nNo global memory access\nRead-only mounts only\nCannot issue cross-group commands"]
+    SANDBOXED["Sandboxed\n(Container Agents / Alfred)\nZero inherent trust\nEphemeral VM — destroyed on completion\nAll outputs verified by host before action"]
+    HOSTILE["Hostile\n(Messaging Payloads)\nTreated as potential injection vectors\nNever interpreted as commands without host mediation"]
+    ROOT -->|delegates to| UNTRUSTED
+    ROOT -->|spawns| SANDBOXED
+    UNTRUSTED -->|sends messages through| SANDBOXED
+    HOSTILE -->|input to| SANDBOXED
+    style ROOT fill:#1a3a1a,color:#aaffaa,stroke:#4a8a4a
+    style UNTRUSTED fill:#3a2a1a,color:#ffddaa,stroke:#8a6a4a
+    style SANDBOXED fill:#2d2d2d,color:#7fdbff,stroke:#4a6a8a
+    style HOSTILE fill:#3d0000,color:#ff6b6b,stroke:#ff6b6b
 ```
 
 ### OpenClaw — Application-Layer Trust Model
@@ -156,11 +181,11 @@ graph TD
 
 | Attack Surface | NanoClaw | OpenClaw |
 |---------------|----------|----------|
-| Prompt injection → host escape | Blocked by VM boundary | Application-layer mitigations only |
+| Prompt injection → host escape | Blocked by VM boundary (UID 1000 + ephemeral container) | Application-layer mitigations only |
 | Cross-session data leak | Blocked by filesystem partitioning | Possible — single trust boundary |
 | Credential exposure in container | Only API key, no persistent auth | Configurable, defaults vary |
 | Network attack surface | None — containers have no network stack | TCP/18789 WebSocket, loopback default |
-| Supply chain (skills) | Static merge, no runtime exec of skill code | 7.1% of ClawHub skills mishandle secrets; 283–341 confirmed credential stealers |
+| Supply chain (skills) | Static merge, no runtime exec of skill code (see Section 6) | 7.1% of ClawHub skills mishandle secrets; 283–341 confirmed credential stealers (see Section 6) |
 | Multi-tenant | Not supported (by design — single user) | Not supported (explicit doc disclaimer) |
 | Memory accumulation (CWE-770) | N/A | Known bug in `command-queue.ts` — LaneState Map never cleaned, causes OOM |
 | WebSocket hijacking | N/A | Session fixation via CSRF → persistent bidirectional access |
@@ -203,9 +228,11 @@ sequenceDiagram
 
     CLIENT->>GW: WebSocket connect
     GW->>GW: Validate first frame (handshake)
+    alt First frame invalid
+        GW-->>CLIENT: Immediate socket closure (no error message)
+    end
     GW-->>CLIENT: hello-ok payload
     Note over GW,CLIENT: Contains: network presence,<br/>execution health, policy details
-
     CLIENT->>GW: Message event
     GW->>GW: Lane Queue (FIFO per session)
     GW->>AGENT: Dispatch task
@@ -216,6 +243,7 @@ sequenceDiagram
 **Properties:**
 - Bidirectional, real-time
 - Strict FIFO per lane prevents race conditions
+- Invalid first frames result in immediate silent socket closure (no error payload leaked)
 - Unencrypted by default — TLS is operator responsibility
 - Session fixation risk on hijack
 
@@ -272,6 +300,37 @@ graph LR
     style PROPOSED fill:#1a1a1a,color:#888,stroke:#555,stroke-dasharray:5
 ```
 
+### OpenClaw — Context Management Strategy
+
+Because OpenClaw runs long-lived agent sessions over WebSocket, accumulated context (turns + large tool results) eventually threatens the model's context window. OpenClaw addresses this with an eight-stage pipeline. Stages S1 through S8 are applied in sequence to every context before the next inference call. The Head (system prompt) and Tail (latest turns) are treated as **inviolable** by the Head/Tail Preservation stage — they are never discarded regardless of budget pressure; all pruning targets mid-session filler between them.
+
+```mermaid
+flowchart TD
+    START["Incoming context\n(accumulated turns + tool results)"]
+    S1["① Pre-Compaction Memory Flush\nFlush critical facts to MEMORY.md\nbefore context is compacted"]
+    S2["② Context Window Guards\nMonitor token count against model limit\ntrigger intervention thresholds"]
+    S3["③ Tool Result Guard\nTruncate or summarize large tool outputs\nbefore re-injection into context"]
+    S4["④ Turn-Based Limiting\nEnforce maximum turn count per session\nprevent runaway inference chains"]
+    S5["⑤ Cache-Aware Pruning\nDrop turns that fall outside cache windows\nprioritize cache-hit candidates"]
+    S6["⑥ Head/Tail Preservation\nRetain system prompt (head) + latest turns (tail)\ndiscard mid-session filler\n[INVIOLABLE — never overridden by budget pressure]"]
+    S7["⑦ Adaptive Chunk Sizing\nDynamically resize message batches\nbased on remaining context budget"]
+    S8["⑧ Staged Summarization\nMulti-pass compression of older turns\ninto progressively shorter summaries"]
+    FINAL["Pruned context\nready for next inference call"]
+    START --> S1 --> S2 --> S3 --> S4 --> S5 --> S6 --> S7 --> S8 --> FINAL
+    NOTE["Combined effect: prevents context overflow\nwithout losing semantically critical content\nCurrent recall baseline: ~60–70%"]
+    style NOTE fill:#1a1a3a,color:#aaaaff,stroke:#533483
+    style START fill:#0f3460,color:#eee
+    style FINAL fill:#0f3460,color:#eee
+    style S1 fill:#16213e,color:#eee,stroke:#e94560
+    style S2 fill:#16213e,color:#eee,stroke:#e94560
+    style S3 fill:#16213e,color:#eee,stroke:#e94560
+    style S4 fill:#16213e,color:#eee,stroke:#e94560
+    style S5 fill:#16213e,color:#eee,stroke:#e94560
+    style S6 fill:#16213e,color:#eee,stroke:#e94560
+    style S7 fill:#16213e,color:#eee,stroke:#e94560
+    style S8 fill:#16213e,color:#eee,stroke:#e94560
+```
+
 ---
 
 ## 6. Extensibility / Skills Engine
@@ -301,6 +360,27 @@ flowchart LR
 - Every integration is an auditable source diff
 - Codebase stays small (skills don't accumulate as runtime deps)
 - Follows Anthropic Agent Skills open standard
+
+### NanoClaw — Channel Registry Interface
+
+Each channel adapter in NanoClaw is registered through a factory pattern that enforces a uniform five-method interface. This means any new channel integration is automatically subject to the same lifecycle and ownership guarantees without requiring changes to the orchestrator. The interface is:
+
+```typescript
+interface ChannelAdapter {
+  connect(): Promise<void>;
+  sendMessage(jid: string, content: string): Promise<void>;
+  isConnected(): boolean;
+  ownsJid(jid: string): boolean;
+  disconnect(): Promise<void>;
+}
+```
+
+- `connect` / `disconnect` — lifecycle hooks called by the Scheduler Loop
+- `sendMessage` — the only outbound path; JID must be validated by the adapter before use
+- `isConnected` — polled by the Orchestrator's health-check loop
+- `ownsJid` — used to route inbound messages to the correct adapter when multiple channels are active simultaneously
+
+Adapters that do not implement all five methods are rejected at registration time, preventing silent routing failures.
 
 ### OpenClaw — Runtime Plugin Registry (ClawHub)
 
@@ -423,16 +503,19 @@ graph LR
 
 ### NanoClaw
 
+Concurrency is explicitly bounded by the **Group Queue**, which enforces `MAX_CONCURRENT_CONTAINERS` and uses disk-based queuing during load spikes. Each group receives an isolated container lifecycle with no shared state between groups.
+
 ```mermaid
 graph TD
     MSG[Incoming Message] --> GROUP[Identify Group]
-    GROUP --> CONTAINER[Spawn Container]
+    GROUP --> GQ["Group Queue\n(MAX_CONCURRENT_CONTAINERS enforced)\ndisk-based queuing during spikes"]
+    GQ --> CONTAINER[Spawn Container]
     CONTAINER --> EXEC[Execute Task]
     EXEC --> DESTROY[Destroy Container]
     DESTROY --> PERSIST[Write artifacts to shared FS]
-
-    NOTE2["Each group = isolated container lifecycle\nNo shared state between groups\nNo concurrent containers per group (implicit)"]
+    NOTE2["Each group = isolated container lifecycle\nNo shared state between groups\nConcurrency explicitly capped by Group Queue"]
     style NOTE2 fill:#1a2a1a,color:#aaffaa
+    style GQ fill:#2a1a2a,color:#ffaaff
 ```
 
 ### OpenClaw — Lane Queue (Default Serial, Explicit Parallel)
@@ -495,7 +578,7 @@ quadrantChart
 ## 12. Active Development Signals (from open PRs)
 
 ### NanoClaw (open PR analysis)
-- **IPC rewrite** (#816) — moving to JSON-RPC 2.0 over stdio (architectural shift away from filesystem IPC)
+- **IPC rewrite** (#816) — moving to JSON-RPC 2.0 over stdio (architectural shift away from filesystem IPC; also changes the threat model: stdio is not cryptographically verified the way the current filesystem JSON path is, so the transition requires careful re-evaluation of the IPC Authorization boundary described in Section 3)
 - **Web Chat UI** (#797) — 77k line PR adding browser channel, Cloudflare tunnel, Ollama, Airtable
 - **Memory system** (#560/#561) — RAG-based semantic memory being added
 - **New channels flood** — QQ, WeChat Work via NapCat, Matrix, Mattermost, Google Chat
@@ -510,4 +593,4 @@ quadrantChart
 
 ---
 
-> **Bottom line:** NanoClaw is being pushed toward richer features (web UI, RAG memory, more channels) while trying to maintain its security-first identity. OpenClaw is maturing its core (fixing IPC bugs, better memory, provider breadth). The gap in security model is structural — NanoClaw's container boundary is a design constraint that OpenClaw doesn't share and can't easily retrofit.
+> **Bottom line:** NanoClaw is being pushed toward richer features (web UI, RAG memory, more channels) while trying to maintain its security-first identity; the eight-stage context management investment in OpenClaw signals that long-session reliability is now a first-class concern for that project as well. OpenClaw is maturing its core (fixing IPC bugs, better memory, provider breadth). The gap in security model is structural — NanoClaw's container boundary is a design constraint that OpenClaw doesn't share and can't easily retrofit.
